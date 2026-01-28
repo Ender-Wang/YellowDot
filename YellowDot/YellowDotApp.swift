@@ -39,6 +39,7 @@ struct WindowInfo {
         COLORED_MENUBAR_ICON_NAMES.contains(name)
             && CONTROL_CENTER_NAMES.contains(ownerName)
     }
+
     var isDot: Bool {
         name == "StatusIndicator"
     }
@@ -53,7 +54,20 @@ struct WindowInfo {
         }
 
         let id = (dict["kCGWindowNumber"] as? Int) ?? 0
-        let screen = CGSCopyManagedDisplayForWindow(cid, id)?.takeRetainedValue() as String?
+
+        // Safely get screen identifier - may fail with "invalid display identifier" on display changes
+        var screen: String? = nil
+        var space: Int? = nil
+
+        if id > 0 {
+            if let managedDisplay = CGSCopyManagedDisplayForWindow(cid, id)?.takeRetainedValue() as String?,
+               !managedDisplay.isEmpty
+            {
+                screen = managedDisplay
+                space = CGSManagedDisplayGetCurrentSpace(cid, screen as CFString?)
+            }
+        }
+
         return WindowInfo(
             bounds: rect,
             memoryUsage: (dict["kCGWindowMemoryUsage"] as? Int) ?? 0,
@@ -67,7 +81,7 @@ struct WindowInfo {
             isOnscreen: (dict["kCGWindowIsOnscreen"] as? Int) ?? 0,
             name: (dict["kCGWindowName"] as? String) ?? "",
             screen: screen,
-            space: CGSManagedDisplayGetCurrentSpace(cid, screen as CFString?)
+            space: space
         )
     }
 }
@@ -207,7 +221,7 @@ class WindowManager: ObservableObject {
 }
 
 func mainActor(_ action: @escaping @MainActor () -> Void) {
-    Task.init { await MainActor.run { action() }}
+    Task { await MainActor.run { action() }}
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -218,9 +232,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var dotHider: Timer?
     var windowFetcher: Timer?
 
+    /// Prevent App Nap from suspending our timers
+    var activityToken: NSObjectProtocol?
+
     var didBecomeActiveAtLeastOnce = false
 
-    func application(_ application: NSApplication, open urls: [URL]) {
+    func application(_: NSApplication, open _: [URL]) {
         guard didBecomeActiveAtLeastOnce else {
             return
         }
@@ -230,7 +247,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         WM.open("settings")
     }
 
-    func applicationDidBecomeActive(_ notification: Notification) {
+    func applicationDidBecomeActive(_: Notification) {
         guard didBecomeActiveAtLeastOnce else {
             didBecomeActiveAtLeastOnce = true
             return
@@ -262,9 +279,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    func applicationDidFinishLaunching(_: Notification) {
         AppDelegate.instance = self
         Defaults[.launchCount] += 1
+
+        // Disable automatic termination - app needs to stay running in background
+        ProcessInfo.processInfo.disableAutomaticTermination("YellowDot needs to run continuously to hide the indicator dots")
+        ProcessInfo.processInfo.disableSuddenTermination()
+
+        // Disable App Nap - timers need to fire even when app is in background
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiatedAllowingIdleSystemSleep,
+            reason: "YellowDot needs to continuously monitor and adjust indicator dot colors"
+        )
 
         NSApp.windows.first { $0.title.contains("Settings") }?.close()
 
@@ -297,7 +324,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(windowDidBecomeMainNotification), name: NSWindow.didBecomeMainNotification, object: nil)
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+    func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool {
         false
     }
 
@@ -314,16 +341,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.setActivationPolicy(.regular)
         }
     }
-
 }
 
 extension NSAppearance {
-    var isDark: Bool { name == .vibrantDark || name == .darkAqua }
-    var isLight: Bool { !isDark }
-    static var dark: NSAppearance? { NSAppearance(named: .darkAqua) }
-    static var light: NSAppearance? { NSAppearance(named: .aqua) }
-    static var vibrantDark: NSAppearance? { NSAppearance(named: .vibrantDark) }
-    static var vibrantLight: NSAppearance? { NSAppearance(named: .vibrantLight) }
+    var isDark: Bool {
+        name == .vibrantDark || name == .darkAqua
+    }
+
+    var isLight: Bool {
+        !isDark
+    }
+
+    static var dark: NSAppearance? {
+        NSAppearance(named: .darkAqua)
+    }
+
+    static var light: NSAppearance? {
+        NSAppearance(named: .aqua)
+    }
+
+    static var vibrantDark: NSAppearance? {
+        NSAppearance(named: .vibrantDark)
+    }
+
+    static var vibrantLight: NSAppearance? {
+        NSAppearance(named: .vibrantLight)
+    }
 }
 
 func statusBarAppearance(screen: String?) -> NSAppearance? {
@@ -342,11 +385,11 @@ extension NSScreen {
         else { return nil }
         return CGDirectDisplayID(id.uint32Value)
     }
+
     var uuid: String {
         guard let id, let uuid = CGDisplayCreateUUIDFromDisplayID(id) else { return "" }
         let uuidValue = uuid.takeRetainedValue()
-        let uuidString = CFUUIDCreateString(kCFAllocatorDefault, uuidValue) as String
-        return uuidString
+        return CFUUIDCreateString(kCFAllocatorDefault, uuidValue) as String
     }
 }
 
@@ -357,18 +400,23 @@ enum DotColor: String, Defaults.Serializable {
     case white
     case dim
 
+    // Use slightly less extreme value for light to avoid triggering EDR/HDR behavior on XDR displays
+    // 1.0 can cause EDR activation on MacBook Pro XDR screens
+    private static let darkBrightness: Float = -1.0
+    private static let lightBrightness: Float = 0.95
+
     @MainActor func brightness(window: WindowInfo) -> Float {
         switch self {
         case .black:
-            -1.0
+            Self.darkBrightness
         case .default:
             0.0
         case .white:
-            1.0
+            Self.lightBrightness
         case .dim:
             -0.7
         case .adaptive:
-            (!CGSIsMenuBarVisibleOnSpace(cid, window.space ?? 1) || (statusBarAppearance(screen: window.screen)?.isLight ?? true)) ? -1.0 : 1.0
+            (!CGSIsMenuBarVisibleOnSpace(cid, window.space ?? 1) || (statusBarAppearance(screen: window.screen)?.isLight ?? true)) ? Self.darkBrightness : Self.lightBrightness
         }
     }
 }
