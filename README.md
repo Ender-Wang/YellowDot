@@ -2,9 +2,9 @@
 
 ###### Hide the macOS yellow recording dot in the corner of your screen
 
-## v3 (compatible with macOS 15 and 26)
+## v3 (compatible with macOS 15 ~~and 26~~)
 
-Bring compatibility with macOS 15 and 26. It's compiled with Xcode 26.2, should work on older versions as well.
+Bring compatibility with macOS 15 ~~and 26. It's compiled with Xcode 26.2, should work on older versions as well~~.
 
 ## v2 (after macOS 13)
 
