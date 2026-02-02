@@ -187,25 +187,138 @@ func getWindows() -> [WindowInfo] {
     return dicts.map { WindowInfo.fromInfoDict($0) }
 }
 
-@MainActor var windows: [WindowInfo] = []
+/// Detects if Mission Control (Exposé) is currently active.
+/// When Mission Control is active, the Dock window's Y coordinate becomes non-zero.
+func isMissionControlActive() -> Bool {
+    let options = CGWindowListOption(arrayLiteral: .optionOnScreenOnly)
+    guard let windowsListInfo = CGWindowListCopyWindowInfo(options, CGWindowID(0)) as? [[String: Any]] else {
+        return false
+    }
 
-@MainActor func setWindowBrightness(color: DotColor, predicate: (WindowInfo) -> Bool) {
-    let windows = windows.filter(predicate)
-    guard !windows.isEmpty else {
+    for window in windowsListInfo {
+        guard let ownerName = window["kCGWindowOwnerName"] as? String,
+              ownerName == "Dock",
+              let bounds = window["kCGWindowBounds"] as? [String: CGFloat],
+              let y = bounds["Y"]
+        else {
+            continue
+        }
+
+        // When Mission Control is active, the Dock window moves (Y > 0)
+        if y > 0 {
+            return true
+        }
+    }
+
+    return false
+}
+
+@MainActor var windows: [WindowInfo] = []
+@MainActor var missionControlActive: Bool = false
+
+/// Tracks ongoing brightness animations by window ID
+@MainActor var brightnessAnimations: [CGSWindow: Timer] = [:]
+
+/// Current brightness values for each window (for animation interpolation)
+@MainActor var currentBrightness: [CGSWindow: Float] = [:]
+
+/// Target brightness values for each window (to avoid restarting animations)
+@MainActor var targetBrightness: [CGSWindow: Float] = [:]
+
+/// Cleans up stale entries from brightness tracking dictionaries
+@MainActor func cleanupStaleBrightnessData() {
+    let activeWindowIds = Set(windows.map { $0.number })
+    currentBrightness = currentBrightness.filter { activeWindowIds.contains($0.key) }
+    targetBrightness = targetBrightness.filter { activeWindowIds.contains($0.key) }
+    // Don't clean up animations - they have their own cleanup when complete
+}
+
+/// Sets window brightness with automatic animation when brightness changes significantly
+/// - Parameters:
+///   - color: The target dot color
+///   - predicate: Filter for which windows to affect
+///   - animated: If true, always animate. If false, only animate when brightness change is significant.
+@MainActor func setWindowBrightness(color: DotColor, predicate: (WindowInfo) -> Bool, animated: Bool = false) {
+    let filteredWindows = windows.filter(predicate)
+    guard !filteredWindows.isEmpty else {
         return
     }
 
-    #if DEBUG
-        for window in windows {
-            print(window)
-        }
-    #endif
+    for window in filteredWindows {
+        let newTargetBrightness = color.brightness(window: window)
+        let currentTarget = targetBrightness[window.number]
+        let currentValue = currentBrightness[window.number] ?? 0.0
 
-    for window in windows {
-        var ids = [window.number]
-        var brightnesses: [Float] = [color.brightness(window: window)]
-        CGSSetWindowListBrightness(cid, &ids, &brightnesses, Int32(1))
+        // If target hasn't changed and animation is in progress, skip
+        if let existingTarget = currentTarget,
+           abs(existingTarget - newTargetBrightness) < 0.001,
+           brightnessAnimations[window.number] != nil
+        {
+            continue
+        }
+
+        let brightnessChange = abs(newTargetBrightness - currentValue)
+
+        // Animate if explicitly requested OR if brightness changes significantly (> 0.1)
+        // This catches fullscreen transitions where menubar background changes
+        if animated || brightnessChange > 0.1 {
+            #if DEBUG
+                print("Animating \(window.name) from \(currentValue) to \(newTargetBrightness)")
+            #endif
+            animateBrightness(window: window, to: newTargetBrightness, duration: 0.3)
+        } else if brightnessChange > 0.001 {
+            // Small change - apply immediately without animation
+            applyBrightness(window: window, brightness: newTargetBrightness)
+            targetBrightness[window.number] = newTargetBrightness
+        }
+        // If change is negligible (< 0.001), skip entirely
     }
+}
+
+/// Immediately applies brightness to a window
+@MainActor func applyBrightness(window: WindowInfo, brightness: Float) {
+    var ids = [window.number]
+    var brightnesses: [Float] = [brightness]
+    CGSSetWindowListBrightness(cid, &ids, &brightnesses, Int32(1))
+    currentBrightness[window.number] = brightness
+}
+
+/// Animates brightness from current value to target over duration
+@MainActor func animateBrightness(window: WindowInfo, to newTarget: Float, duration: TimeInterval) {
+    // Cancel any existing animation for this window
+    brightnessAnimations[window.number]?.invalidate()
+
+    // Record the target
+    targetBrightness[window.number] = newTarget
+
+    let startBrightness = currentBrightness[window.number] ?? 0.0
+    let steps = 20 // Number of animation steps (increased for smoother animation)
+    let stepDuration = duration / Double(steps)
+    var currentStep = 0
+
+    let timer = Timer.scheduledTimer(withTimeInterval: stepDuration, repeats: true) { [window] timer in
+        mainActor {
+            currentStep += 1
+            let progress = Float(currentStep) / Float(steps)
+            // Ease-in-out curve for smoother animation
+            let easedProgress: Float
+            if progress < 0.5 {
+                easedProgress = 2.0 * progress * progress
+            } else {
+                easedProgress = 1.0 - pow(-2.0 * progress + 2.0, 2.0) / 2.0
+            }
+            let newBrightness = startBrightness + (newTarget - startBrightness) * easedProgress
+
+            applyBrightness(window: window, brightness: newBrightness)
+
+            if currentStep >= steps {
+                timer.invalidate()
+                brightnessAnimations.removeValue(forKey: window.number)
+            }
+        }
+    }
+
+    brightnessAnimations[window.number] = timer
 }
 
 func pub<T: Equatable>(_ key: Defaults.Key<T>) -> Publishers.Filter<Publishers.RemoveDuplicates<Publishers.Drop<AnyPublisher<Defaults.KeyChange<T>, Never>>>> {
@@ -259,22 +372,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor func initDotHider(timeInterval: TimeInterval) {
-        setWindowBrightness(color: Defaults[.dotColor]) { $0.isDot }
-        setWindowBrightness(color: Defaults[.indicatorColor]) { $0.isControlCenterColoredIcon }
+        setWindowBrightness(color: Defaults[.dotColor], predicate: { $0.isDot })
+        setWindowBrightness(color: Defaults[.indicatorColor], predicate: { $0.isControlCenterColoredIcon })
 
         windowFetcher?.invalidate()
         dotHider?.invalidate()
 
         windowFetcher = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-            mainActor { windows = getWindows() }
+            mainActor {
+                windows = getWindows()
+                cleanupStaleBrightnessData()
+            }
         }
         dotHider = Timer.scheduledTimer(withTimeInterval: timeInterval, repeats: true) { _ in
             let dotColor = Defaults[.dotColor]
             guard dotColor != .default else { return }
             let indicatorColor = Defaults[.indicatorColor]
+            let mcActive = isMissionControlActive()
             mainActor {
-                setWindowBrightness(color: dotColor) { $0.isDot }
-                setWindowBrightness(color: indicatorColor) { $0.isControlCenterColoredIcon }
+                AppDelegate.instance.handleMissionControlTransition(
+                    mcActive: mcActive,
+                    dotColor: dotColor,
+                    indicatorColor: indicatorColor
+                )
             }
         }
     }
@@ -313,15 +433,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         initDotHider(timeInterval: 1)
 
         pub(.dotColor).sink { dotColor in
-            setWindowBrightness(color: dotColor.newValue) { $0.isDot }
+            setWindowBrightness(color: dotColor.newValue, predicate: { $0.isDot })
         }.store(in: &observers)
         pub(.indicatorColor).sink { indicatorColor in
             CGRequestScreenCaptureAccess()
-            setWindowBrightness(color: indicatorColor.newValue) { $0.isControlCenterColoredIcon }
+            setWindowBrightness(color: indicatorColor.newValue, predicate: { $0.isControlCenterColoredIcon })
         }.store(in: &observers)
 
         NotificationCenter.default.addObserver(self, selector: #selector(windowWillClose), name: NSWindow.willCloseNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(windowDidBecomeMainNotification), name: NSWindow.didBecomeMainNotification, object: nil)
+
+        // Listen for space changes to respond faster to Mission Control
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(activeSpaceDidChange),
+            name: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil
+        )
+    }
+
+    @objc func activeSpaceDidChange(_ notification: Notification) {
+        // Space change notification - trigger immediate check via dotHider logic
+        // This provides faster response than waiting for the 1-second timer
+        let dotColor = Defaults[.dotColor]
+        guard dotColor != .default else { return }
+        let indicatorColor = Defaults[.indicatorColor]
+        let mcActive = isMissionControlActive()
+
+        mainActor {
+            self.handleMissionControlTransition(mcActive: mcActive, dotColor: dotColor, indicatorColor: indicatorColor)
+        }
+    }
+
+    /// Handles Mission Control state transitions with animations
+    /// Centralized logic to avoid duplication between dotHider and activeSpaceDidChange
+    @MainActor func handleMissionControlTransition(mcActive: Bool, dotColor: DotColor, indicatorColor: DotColor) {
+        let wasMissionControlActive = missionControlActive
+        missionControlActive = mcActive
+
+        if mcActive, !wasMissionControlActive {
+            // Entering Mission Control - animate to system default color
+            setWindowBrightness(color: .default, predicate: { $0.isDot }, animated: true)
+            setWindowBrightness(color: .default, predicate: { $0.isControlCenterColoredIcon }, animated: true)
+        } else if !mcActive, wasMissionControlActive {
+            // Exiting Mission Control - animate back to custom color
+            setWindowBrightness(color: dotColor, predicate: { $0.isDot }, animated: true)
+            setWindowBrightness(color: indicatorColor, predicate: { $0.isControlCenterColoredIcon }, animated: true)
+        } else if !mcActive {
+            // Normal operation - apply without animation (handles fullscreen transitions)
+            setWindowBrightness(color: dotColor, predicate: { $0.isDot })
+            setWindowBrightness(color: indicatorColor, predicate: { $0.isControlCenterColoredIcon })
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool {
@@ -408,15 +570,17 @@ enum DotColor: String, Defaults.Serializable {
     @MainActor func brightness(window: WindowInfo) -> Float {
         switch self {
         case .black:
-            Self.darkBrightness
+            return Self.darkBrightness
         case .default:
-            0.0
+            return 0.0
         case .white:
-            Self.lightBrightness
+            return Self.lightBrightness
         case .dim:
-            -0.7
+            return -0.7
         case .adaptive:
-            (!CGSIsMenuBarVisibleOnSpace(cid, window.space ?? 1) || (statusBarAppearance(screen: window.screen)?.isLight ?? true)) ? Self.darkBrightness : Self.lightBrightness
+            // When menu bar is not visible (fullscreen apps), use dark brightness
+            // When menu bar is visible: use dark for light appearance, light for dark appearance
+            return (!CGSIsMenuBarVisibleOnSpace(cid, window.space ?? 1) || (statusBarAppearance(screen: window.screen)?.isLight ?? true)) ? Self.darkBrightness : Self.lightBrightness
         }
     }
 }
