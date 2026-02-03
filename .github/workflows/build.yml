@@ -1,0 +1,80 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'YellowDot.xcodeproj/project.pbxproj'
+  workflow_dispatch:
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+      build: ${{ steps.check.outputs.build }}
+      commit_message: ${{ steps.check.outputs.commit_message }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version
+        id: check
+        run: |
+          VERSION=$(grep 'MARKETING_VERSION' YellowDot.xcodeproj/project.pbxproj | head -1 | sed 's/.*= \(.*\);/\1/' | tr -d ' ')
+          BUILD=$(grep 'CURRENT_PROJECT_VERSION' YellowDot.xcodeproj/project.pbxproj | head -1 | sed 's/.*= \(.*\);/\1/' | tr -d ' ')
+          COMMIT_MSG=$(git log -1 --pretty=%B | tail -n +2 | sed '/^$/d')
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "build=$BUILD" >> $GITHUB_OUTPUT
+          echo "commit_message<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMIT_MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          git fetch --tags
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "Tag v$VERSION exists, skipping"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "Creating release v$VERSION (build $BUILD)"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.2'
+
+      - name: Build
+        run: |
+          xcodebuild -project YellowDot.xcodeproj -scheme YellowDot -configuration Release \
+            -derivedDataPath build CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build
+          strip build/Build/Products/Release/YellowDot.app/Contents/MacOS/YellowDot || true
+
+      - name: Create DMG
+        id: dmg
+        run: |
+          mkdir -p dmg_contents
+          cp -R build/Build/Products/Release/YellowDot.app dmg_contents/
+          ln -s /Applications dmg_contents/Applications
+          hdiutil create -volname "YellowDot" -srcfolder dmg_contents -ov -format UDZO "YellowDot-v${{ needs.check-version.outputs.version }}.dmg"
+          echo "dmg_name=YellowDot-v${{ needs.check-version.outputs.version }}.dmg" >> $GITHUB_OUTPUT
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: v${{ needs.check-version.outputs.version }} (build ${{ needs.check-version.outputs.build }})
+          body: ${{ needs.check-version.outputs.commit_message }}
+          files: ${{ steps.dmg.outputs.dmg_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
